@@ -1,166 +1,121 @@
 package main
 
 import (
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
-	"fmt"
-	"io"
+	"flag"
+	"github.com/gorilla/websocket"
+	"html/template"
+	"log"
 	"net/http"
 )
 
-func main() {
-	http.HandleFunc("/", wsHandler)
-	http.ListenAndServe(":8000", nil)
+var addr = flag.String("addr", "localhost:8080", "http service address")
 
-}
+var upgrader = websocket.Upgrader{} // use default options
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	// проверяем заголовки
-	if r.Header.Get("Upgrade") != "websocket" {
-		return
-	}
-	if r.Header.Get("Connection") != "Upgrade" {
-		return
-	}
-	k := r.Header.Get("Sec-Websocket-Key")
-	if k == "" {
-		return
-	}
-
-	// вычисляем ответ
-	sum := k + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	hash := sha1.Sum([]byte(sum))
-	str := base64.StdEncoding.EncodeToString(hash[:])
-
-	// Берем под контроль соединение https://pkg.go.dev/net/http#Hijacker
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		return
-	}
-	conn, bufrw, err := hj.Hijack()
+func echo(w http.ResponseWriter, r *http.Request) {
+	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Print("upgrade:", err)
 		return
 	}
-	defer conn.Close()
-
-	// формируем ответ
-	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-	bufrw.WriteString("Upgrade: websocket\r\n")
-	bufrw.WriteString("Connection: Upgrade\r\n")
-	bufrw.WriteString("Sec-Websocket-Accept: " + str + "\r\n\r\n")
-	bufrw.Flush()
-
-	// сообщение состоит из одного или нескольких фреймов
-	var message []byte
+	defer c.Close()
 	for {
-		// заголовок состоит из 2 — 14 байт
-		buf := make([]byte, 2, 12)
-		// читаем первые 2 байта
-		_, err := bufrw.Read(buf)
+		mt, message, err := c.ReadMessage()
 		if err != nil {
-			return
+			log.Println("read:", err)
+			break
 		}
-
-		finBit := buf[0]       // фрагментированное ли сообщение 129
-		finBit = finBit >> 7   // фрагментированное ли сообщение
-		opCode := buf[0] & 0xf // опкод
-
-		maskBit := buf[1]      // замаскированы ли данные 141
-		maskBit = maskBit >> 7 // замаскированы ли данные
-
-		// оставшийся размер заголовка
-		extra := 0
-		if maskBit == 1 {
-			extra += 4 // +4 байта маскировочный ключ
-		}
-
-		size := uint64(buf[1] & 0x7f)
-		if size == 126 {
-			extra += 2 // +2 байта размер данных
-		} else if size == 127 {
-			extra += 8 // +8 байт размер данных
-		}
-
-		if extra > 0 {
-			// читаем остаток заголовка extra <= 12
-			buf = buf[:extra]
-			_, err = bufrw.Read(buf)
-			if err != nil {
-				return
-			}
-
-			if size == 126 {
-				size = uint64(binary.BigEndian.Uint16(buf[:2]))
-				buf = buf[2:] // подвинем начало буфера на 2 байта
-			} else if size == 127 {
-				size = binary.BigEndian.Uint64(buf[:8])
-				buf = buf[8:] // подвинем начало буфера на 8 байт
-			}
-		}
-
-		// маскировочный ключ
-		var mask []byte
-		if maskBit == 1 {
-			// остаток заголовка, последние 4 байта
-			mask = buf
-		}
-
-		// данные фрейма
-		payload := make([]byte, int(size))
-		// читаем полностью и ровно size байт
-		_, err = io.ReadFull(bufrw, payload)
+		log.Printf("recv: %s", message)
+		err = c.WriteMessage(mt, message)
 		if err != nil {
-			return
-		}
-
-		// размаскировываем данные с помощью XOR
-		if maskBit == 1 {
-			for i := 0; i < len(payload); i++ {
-				payload[i] ^= mask[i%4]
-			}
-		}
-
-		// складываем фрагменты сообщения
-		message = append(message, payload...)
-
-		if opCode == 8 { // фрейм закрытия
-			return
-		} else if finBit == 1 { // конец сообщения
-			fmt.Println(string(message))
-		}
-
-		buf = make([]byte, 2)
-		buf[0] |= opCode
-
-		if finBit == 1 {
-			buf[0] |= 0x80
-		}
-
-		if size < 126 {
-			buf[1] |= byte(size)
-		} else if size < 1<<16 {
-			buf[1] |= 126
-			sizze := make([]byte, 2)
-			binary.BigEndian.PutUint16(sizze, uint16(size))
-			buf = append(buf, sizze...)
-		} else {
-			buf[1] |= 127
-			sizze := make([]byte, 8)
-			binary.BigEndian.PutUint64(sizze, size)
-			buf = append(buf, sizze...)
-		}
-		buf = append(buf, message...)
-
-		bufrw.Write(buf)
-		bufrw.Flush()
-
-		if opCode == 8 {
-			fmt.Println(buf)
-			return
-		} else if finBit == 1 {
-			fmt.Println(string(message))
-			message = message[:0]
+			log.Println("write:", err)
+			break
 		}
 	}
 }
+
+func home(w http.ResponseWriter, r *http.Request) {
+	homeTemplate.Execute(w, "ws://"+r.Host+"/echo")
+}
+
+func main() {
+	flag.Parse()
+	log.SetFlags(0)
+	http.HandleFunc("/echo", echo)
+	http.HandleFunc("/", home)
+	log.Fatal(http.ListenAndServe(*addr, nil))
+}
+
+var homeTemplate = template.Must(template.New("").Parse(`
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script>  
+window.addEventListener("load", function(evt) {
+    var output = document.getElementById("output");
+    var input = document.getElementById("input");
+    var ws;
+    var print = function(message) {
+        var d = document.createElement("div");
+        d.textContent = message;
+        output.appendChild(d);
+        output.scroll(0, output.scrollHeight);
+    };
+    document.getElementById("open").onclick = function(evt) {
+        if (ws) {
+            return false;
+        }
+        ws = new WebSocket("{{.}}");
+        ws.onopen = function(evt) {
+            print("OPEN");
+        }
+        ws.onclose = function(evt) {
+            print("CLOSE");
+            ws = null;
+        }
+        ws.onmessage = function(evt) {
+            print("RESPONSE: " + evt.data);
+        }
+        ws.onerror = function(evt) {
+            print("ERROR: " + evt.data);
+        }
+        return false;
+    };
+    document.getElementById("send").onclick = function(evt) {
+        if (!ws) {
+            return false;
+        }
+        print("SEND: " + input.value);
+        ws.send(input.value);
+        return false;
+    };
+    document.getElementById("close").onclick = function(evt) {
+        if (!ws) {
+            return false;
+        }
+        ws.close();
+        return false;
+    };
+});
+</script>
+</head>
+<body>
+<table>
+<tr><td valign="top" width="50%">
+<p>Click "Open" to create a connection to the server, 
+"Send" to send a message to the server and "Close" to close the connection. 
+You can change the message and send multiple times.
+<p>
+<form>
+<button id="open">Open</button>
+<button id="close">Close</button>
+<p><input id="input" type="text" value="Hello world!">
+<button id="send">Send</button>
+</form>
+</td><td valign="top" width="50%">
+<div id="output" style="max-height: 70vh;overflow-y: scroll;"></div>
+</td></tr></table>
+</body>
+</html>
+`))
